@@ -90,7 +90,7 @@ This handles adding the required syntax properties to HTML
 comments embedded in Lisp code. This is mostly just stolen from
 sgml-mode.")
 
-(defun lisp-marker-infer-comment-settings ()
+(defun lisp-marker-infer-comment-settings (&optional noerror)
   "Infer the right comment characters when in `lisp-markup-minor-mode'.
 
 This handles checking if we're in Lisp mode or HTML mode, and
@@ -114,6 +114,14 @@ functions on code that contains both Lisp and HTML."
      (modify-syntax-entry ?> ")")
      (modify-syntax-entry 40 "\"")
      (modify-syntax-entry 41 "\"")
+     (progn ,@body)))
+
+(defmacro lisp-markup-with-all-brackets (&rest body)
+  "Run BODY in a context where ?< and ?> behave as brackets."
+  (declare (indent 0))
+  `(with-syntax-table (make-syntax-table (syntax-table))
+     (modify-syntax-entry ?< "(")
+     (modify-syntax-entry ?> ")")
      (progn ,@body)))
 
 (defmacro lisp-markup-with-sgml-tag-table (&rest body)
@@ -156,8 +164,9 @@ Returns a pair of beginning and end points, or NOT-FOUND."
         (while t
           (let* ((start (or (ignore-errors
                               (funcall find-start)
-                              (while (nth 4 (syntax-ppss)) ; is in a comment
-                                (funcall find-start))      ; so keep looking
+                              (while (or (nth 3 (syntax-ppss)) ; is in a string
+                                         (nth 4 (syntax-ppss))) ; is in a comment
+                                (funcall find-start)) ; so keep looking
                               (point))
                             (throw 'return not-found)))
                  (end (or (ignore-errors
@@ -205,67 +214,69 @@ returns nil."
           (error "No end tag found!"))))
    nil))
 
+(defun lisp-markup-enclosing-html-boundary ()
+  "Find the nearest boundary between HTML and Lisp sections."
+  (save-excursion
+    (catch 'return
+      (let (html)
+        (while t
+          (let ((tag (lisp-markup-enclosing-html-tag)))
+            (if tag
+                (setf html tag)
+              (throw 'return html)))
+          (goto-char (car html)))))))
+
 ;;; Indentation
 ;;; ===========
+
+(defun lisp-markup-calculate-html-indent ()
+  "Calculate the number of spaces to indent the current line in an
+HTML context."
+  (let ((html (lisp-markup-enclosing-html-boundary)))
+    (+ (save-excursion
+         (save-restriction
+           ;; There are some non-obvious effects created by having
+           ;; indented HTML earlier in the file, or by having HTML
+           ;; tags start later in a line (i.e. after some Lisp).
+           ;; Narrowing to the HTML boundary here avoids those
+           ;; effects, but causes indentation to start in column 0.
+           ;; The below term adds to the indentation to compensate.
+           (narrow-to-region (car html) (cdr html))
+           (lisp-markup-with-sgml-tag-table
+            (lisp-markup-with-<>-as-brackets
+              (sgml-calculate-indent)))))
+       ;; If we're on the last line, or the second non-blank line, of
+       ;; the HTML section then add extra indentation to align with
+       ;; the start of the HTML section.
+       (let ((second-line (save-excursion
+                            (goto-char (car html))
+                            (forward-line)
+                            (beginning-of-line)
+                            (while (looking-at-p "[[:space:]]*$")
+                              (forward-line))
+                            (line-number-at-pos (point))))
+             (last-line (line-number-at-pos (cdr html))))
+         (or (when (or (<= (line-number-at-pos (point))
+                           second-line)
+                       (>= (line-number-at-pos (point))
+                           last-line))
+               (save-excursion
+                 (goto-char (car html))
+                 (current-column)))
+             0)))))
 
 (defun lisp-markup-indent-line ()
   "Indent a line of Lisp or HTML, according to the line's context."
   (interactive)
   (save-excursion
-    (lisp-markup-with-sgml-tag-table
-     (with-syntax-table (if (>= emacs-major-version 28)
-                            lisp-mode-syntax-table
-                          lisp--mode-syntax-table)
-       (back-to-indentation)
-       (let ((prev-html (save-excursion
-                          (forward-line -1)
-                          (end-of-line)
-                          (lisp-markup-in-html-p))))
-         (cond
-          ;; closing tag
-          ((looking-at-p "</")
-           (let* ((indent
-                   (save-excursion
-                     (forward-sexp 1)
-                     (sgml-skip-tag-backward 1)
-                     (- (point) (progn (beginning-of-line) (point))))))
-             (indent-line-to (max 0 indent))))
-          ;; after closing tag and end of lisp form
-          ((and prev-html
-                (save-excursion
-                  (forward-line -1)
-                  (end-of-line)
-                  (skip-chars-backward "\t\r\n ")
-                  (and (= (char-before) 41)
-                       (progn
-                         (forward-sexp -1)
-                         (skip-chars-backward ",@")
-                         (= (char-after) ?,)))))
-           (indent-line-to
-            (save-excursion
-              (forward-sexp -1)
-              (current-indentation))))
-          ;;
-          ((and prev-html
-                (save-excursion
-                  (forward-line -1)
-                  (back-to-indentation)
-                  (looking-at-p "</")))
-           (indent-line-to
-            (save-excursion
-              (forward-line -1)
-              (back-to-indentation)
-              (- (point) (progn (beginning-of-line) (point))))))
-          ;; sgml indent
-          (prev-html
-           (lisp-markup-with-<>-as-brackets
-             (sgml-indent-line)))
-          ;; lisp indent
-          (:else
-           (let ((indent (calculate-lisp-indent)))
-             (cond
-              ((and indent (listp indent)) (indent-line-to (car indent)))
-              (indent (indent-line-to indent))))))))))
+    (back-to-indentation)
+    (if (lisp-markup-in-html-p)
+        (indent-line-to (lisp-markup-calculate-html-indent))
+      (let ((indent (calculate-lisp-indent)))
+        (when indent
+          (indent-line-to (if (listp indent)
+                              (car indent)
+                            indent))))))
   (when (< (point) (save-excursion (back-to-indentation) (point)))
     (back-to-indentation)))
 
@@ -282,6 +293,19 @@ returns nil."
 ;;; Forward/backward by sexp
 ;;; ========================
 
+(defun lisp-markup-run-without-forward-sexp-function (f &rest args)
+  "Apply F to ARGS with `forward-sexp-function' set to NIL, if
+`lisp-markup-minor-mode' is true. Otherwise, just apply F to ARGS
+normally."
+  (if lisp-markup-minor-mode
+      (lisp-markup-with-all-brackets
+        (let ((forward-sexp-function nil))
+          (apply f args)))
+    (apply f args)))
+
+(advice-add 'up-list :around #'lisp-markup-run-without-forward-sexp-function)
+(advice-add 'slime-parse-form-until :around #'lisp-markup-run-without-forward-sexp-function)
+
 (defun lisp-markup-forward-sexp (&optional n interactive)
   "Move over the next \"sexp\" in the buffer, which includes an entire HTML tag.
 
@@ -289,23 +313,26 @@ This mostly tries to guess if the next thing is HTML or Lisp by
 looking at the beginning of it. It's not foolproof, but it's
 still pretty useful."
   (let ((n (or n 1)))
-    (cond
-     ((< 0 n)
-      (if (looking-at-p "[[:space:]\n]*<[^/=\"![:space:]()]")
-	  (lisp-markup-with-sgml-tag-table
-           (sgml-skip-tag-forward n))
-        (let ((forward-sexp-function nil))
-          (forward-sexp n interactive))))
-     ((< n 0)
-      (if (save-excursion (let ((whitespace-chars (string-to-list " \t\r\n")))
-                            (while (member (char-before) whitespace-chars)
-                              (backward-char)))
-                          (backward-char 2)
-                          (looking-at-p "[^[:space:]'()]>"))
-	  (lisp-markup-with-sgml-tag-table
-           (sgml-skip-tag-backward (- n)))
-        (let ((forward-sexp-function nil))
-          (forward-sexp n interactive)))))))
+    (while (not (zerop n))
+      (cond
+       ((< 0 n)
+        (if (looking-at-p "[[:space:]\n]*<[^/=\"![:space:]()]")
+	    (lisp-markup-with-sgml-tag-table
+             (sgml-skip-tag-forward 1))
+          (let ((forward-sexp-function nil))
+            (forward-sexp 1 interactive)))
+        (setf n (1- n)))
+       ((< n 0)
+        (if (save-excursion (let ((whitespace-chars (string-to-list " \t\r\n")))
+                              (while (member (char-before) whitespace-chars)
+                                (backward-char)))
+                            (backward-char 2)
+                            (looking-at-p "[^[:space:]'()]>"))
+	    (lisp-markup-with-sgml-tag-table
+             (sgml-skip-tag-backward 1))
+          (let ((forward-sexp-function nil))
+            (forward-sexp -1 interactive)))
+        (setf n (1+ n)))))))
 
 ;;; Automatic tag closing
 ;;; =====================
